@@ -8,6 +8,9 @@
 #include "uv.h"
 
 #ifdef _MSC_VER
+#ifdef _WIN64
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+#endif
 JL_DLLEXPORT char *dirname(char *);
 #else
 #include <libgen.h>
