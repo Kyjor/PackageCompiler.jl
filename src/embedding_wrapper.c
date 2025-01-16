@@ -6,11 +6,10 @@
 // Julia headers
 #include "julia.h"
 #include "uv.h"
-
-#ifdef _MSC_VER
-#ifdef _WIN64
-#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+#ifdef _WIN32
+#include <windows.h>
 #endif
+#ifdef _MSC_VER
 JL_DLLEXPORT char *dirname(char *);
 #else
 #include <libgen.h>
@@ -62,6 +61,7 @@ void set_depot_load_path(const char *root_dir) {
 // julia's ui/repl.c)
 #ifdef _WIN32
 int wmain(int argc, wchar_t *wargv[], wchar_t *envp[]) {
+    ShowWindow(GetConsoleWindow(), SW_HIDE);
     char **argv = (char **)malloc(sizeof(char *) * argc);
     if (!argv) return 1;
 
