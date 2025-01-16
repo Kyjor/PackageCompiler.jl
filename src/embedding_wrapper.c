@@ -61,9 +61,19 @@ void set_depot_load_path(const char *root_dir) {
 // julia's ui/repl.c)
 #ifdef _WIN32
 int wmain(int argc, wchar_t *wargv[], wchar_t *envp[]) {
-    ShowWindow(GetConsoleWindow(), SW_HIDE);
     char **argv = (char **)malloc(sizeof(char *) * argc);
     if (!argv) return 1;
+
+    HWND hwnd = GetConsoleWindow();
+    //https://stackoverflow.com/questions/75877438/how-to-hide-console-in-windows-11
+    Sleep(1);//If you execute these code immediately after the program starts, you must wait here for a short period of time, otherwise GetWindow will fail. I speculate that it may be because the console has not been fully initialized.
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    if (owner == NULL) {
+        ShowWindow(hwnd, SW_HIDE); // Windows 10
+    }
+    else {
+        ShowWindow(owner, SW_HIDE);// Windows 11
+    }
 
     for (int i = 0; i < argc; i++) { // write the command line to UTF8
         wchar_t *warg = wargv[i];
