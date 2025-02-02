@@ -697,10 +697,16 @@ function create_sysimg_from_object_file(object_files::Vector{String},
         soname = basename(sysimage_path)
     end
     mkpath(dirname(sysimage_path))
+   
     # Prevent compiler from stripping all symbols from the shared lib.
-    o_file_flags = Sys.isapple() ? `-Wl,-all_load $object_files` : `-Wl,--whole-archive $object_files -Wl,--no-whole-archive`
+    o_file_flags = Sys.isapple() ? `-Wl,-all_load $object_files` :
+                                  `-Wl,--whole-archive $object_files -Wl,--no-whole-archive`
+   
     extra = get_extra_linker_flags(version, compat_level, soname)
-    cmd = `$(bitflag()) $(march()) -shared -L$(julia_libdir()) -L$(julia_private_libdir()) -o $sysimage_path $o_file_flags $(Base.shell_split(ldlibs())) $extra`
+   
+    # Optimize for size
+    cmd = `$(bitflag()) $(march()) -shared -Os -flto -L$(julia_libdir()) -L$(julia_private_libdir()) -o $sysimage_path $o_file_flags $(Base.shell_split(ldlibs())) $extra`
+   
     run_compiler(cmd; cplusplus=true)
     return nothing
 end
@@ -718,7 +724,7 @@ function get_extra_linker_flags(version, compat_level, soname)
     soname_arg = soname === nothing ? `` : `-Wl,-soname,$soname`
     rpath_args = rpath_sysimage()
 
-    extra = Sys.iswindows() ? `-Wl,--export-all-symbols -mwindows` :
+    extra = Sys.iswindows() ? `-Wl,--export-all-symbols -s` :
             Sys.isapple() ? `-fPIC $compat_ver_arg $current_ver_arg $rpath_args` :
             Sys.isunix() ? `-fPIC $soname_arg $rpath_args` :
                 error("unknown machine type, not windows, macOS not UNIX")
