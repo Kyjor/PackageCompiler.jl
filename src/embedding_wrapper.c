@@ -23,6 +23,10 @@ JULIA_DEFINE_FAST_TLS()
 
 // TODO: Windows wmain handling as in repl.c
 
+// Global variables for test and debug modes
+static bool g_test_mode = false;
+static bool g_debug_mode = false;
+
 jl_value_t *checked_eval_string(const char *code) {
     jl_value_t *result = jl_eval_string(code);
     if (jl_exception_occurred()) {
@@ -64,29 +68,128 @@ int wmain(int argc, wchar_t *wargv[], wchar_t *envp[]) {
     char **argv = (char **)malloc(sizeof(char *) * argc);
     if (!argv) return 1;
 
-    HWND hwnd = GetConsoleWindow();
-    //https://stackoverflow.com/questions/75877438/how-to-hide-console-in-windows-11
-    Sleep(1);//If you execute these code immediately after the program starts, you must wait here for a short period of time, otherwise GetWindow will fail. I speculate that it may be because the console has not been fully initialized.
-    HWND owner = GetWindow(hwnd, GW_OWNER);
-    if (owner == NULL) {
-        ShowWindow(hwnd, SW_HIDE); // Windows 10
-    }
-    else {
-        ShowWindow(owner, SW_HIDE);// Windows 11
-    }
-
-    for (int i = 0; i < argc; i++) { // write the command line to UTF8
+    // Process command line arguments for test and debug modes
+    for (int i = 0; i < argc; i++) {
         wchar_t *warg = wargv[i];
         size_t len = WideCharToMultiByte(CP_UTF8, 0, warg, -1, NULL, 0, NULL, NULL);
         if (!len) return 1;
         char *arg = (char *)malloc(len);
         if (!WideCharToMultiByte(CP_UTF8, 0, warg, -1, arg, len, NULL, NULL)) return 1;
         argv[i] = arg;
+
+        if (strcmp(arg, "--test-mode") == 0) {
+            g_test_mode = true;
+            _putenv_s("JG_TEST_MODE", "1");
+        } else if (strcmp(arg, "--debug-mode") == 0) {
+            g_debug_mode = true;
+            _putenv_s("JG_DEBUG_MODE", "1");
+        }
     }
+
+    if (!g_debug_mode) {
+        HWND hwnd = GetConsoleWindow();
+        //https://stackoverflow.com/questions/75877438/how-to-hide-console-in-windows-11
+        Sleep(1);//If you execute these code immediately after the program starts, you must wait here for a short period of time, otherwise GetWindow will fail. I speculate that it may be because the console has not been fully initialized.
+        HWND owner = GetWindow(hwnd, GW_OWNER);
+        if (owner == NULL) {
+            ShowWindow(hwnd, SW_HIDE); // Windows 10
+        }
+        else {
+            ShowWindow(owner, SW_HIDE);// Windows 11
+        }
+    }
+
+    // Find where eventual julia arguments start
+    int program_argc = argc;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--julia-args") == 0) {
+            program_argc = i;
+            break;
+        }
+    }
+    int julia_argc = argc - program_argc;
+    if (julia_argc > 0) {
+        // Replace `--julia-args` with the program name
+        argv[program_argc] = argv[0];
+        char **julia_argv = &argv[program_argc];
+        jl_parse_opts(&julia_argc, &julia_argv);
+    }
+
+    // Get the current exe path so we can compute a relative depot path
+    char *exe_path = (char *)malloc(PATH_MAX);
+    size_t path_size = PATH_MAX;
+    if (!exe_path) {
+        jl_errorf("fatal error: failed to allocate memory: %s",
+                  strerror(errno));
+        free(exe_path);
+        return 1;
+    }
+    if (uv_exepath(exe_path, &path_size)) {
+        jl_error("fatal error: unexpected error while retrieving exepath");
+        free(exe_path);
+        return 1;
+    }
+
+    // Set up LOAD_PATH and DEPOT_PATH
+    char *root_dir = dirname(dirname(exe_path));
+    set_depot_load_path(root_dir);
+
+    jl_init();
+
+    // Initialize Core.ARGS with the full argv.
+    jl_set_ARGS(program_argc, argv);
+
+    // Update ARGS and PROGRAM_FILE
+    checked_eval_string("append!(empty!(Base.ARGS), Core.ARGS)");
+    jl_value_t *firstarg = checked_eval_string("popfirst!(ARGS)");
+    JL_GC_PUSH1(&firstarg);
+    jl_sym_t *var = jl_symbol("PROGRAM_FILE");
+#if JULIA_VERSION_MAJOR == 1 && JULIA_VERSION_MINOR >= 11
+    jl_binding_t *bp = jl_get_binding_wr(jl_base_module, var, /* alloc */ 1);
+    jl_checked_assignment(bp, jl_base_module, var, firstarg);
+#elif JULIA_VERSION_MAJOR == 1 && JULIA_VERSION_MINOR >= 10
+    jl_binding_t *bp = jl_get_binding_wr(jl_base_module, var);
+    jl_checked_assignment(bp, jl_base_module, var, firstarg);
+#elif JULIA_VERSION_MAJOR == 1 && JULIA_VERSION_MINOR >= 9
+    jl_binding_t *bp = jl_get_binding_wr(jl_base_module, var, 1);
+    jl_checked_assignment(bp, firstarg);
+#else
+    jl_set_global(jl_base_module, jl_symbol("PROGRAM_FILE"), firstarg);
+#endif
+    JL_GC_POP();
+
+    // call the work function, and get back a value
+    jl_value_t *jl_retcode = checked_eval_string(JULIA_MAIN "()");
+    int32_t retcode = 0;
+    if (!jl_typeis(jl_retcode, jl_int32_type)) {
+        fprintf(stderr,
+                "ERROR: expected a Cint return value from function " JULIA_MAIN
+                "\n");
+        retcode = 1;
+    } else {
+        retcode = jl_unbox_int32(jl_retcode);
+    }
+
+    // Cleanup and gracefully exit
+    free(exe_path);
+    jl_atexit_hook(retcode);
+    return retcode;
+}
+
 #else
 int main(int argc, char *argv[]) {
     argv = uv_setup_args(argc, argv);
-#endif
+
+    // Process command line arguments for test and debug modes
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--test-mode") == 0) {
+            g_test_mode = true;
+            setenv("JG_TEST_MODE", "1", 1);
+        } else if (strcmp(argv[i], "--debug-mode") == 0) {
+            g_debug_mode = true;
+            setenv("JG_DEBUG_MODE", "1", 1);
+        }
+    }
 
     // Find where eventual julia arguments start
     int program_argc = argc;
