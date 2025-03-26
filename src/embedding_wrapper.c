@@ -51,9 +51,11 @@ void set_depot_load_path(const char *root_dir) {
 #ifdef _WIN32
     _putenv_s("JULIA_DEPOT_PATH", share_dir);
     _putenv_s("JULIA_LOAD_PATH", share_dir);
+    _putenv_s("RELEASE_BUILD", "true");
 #else
     setenv("JULIA_DEPOT_PATH", share_dir, 1);
     setenv("JULIA_LOAD_PATH", share_dir, 1);
+    setenv("RELEASE_BUILD", "true", 1);
 #endif
 }
 
