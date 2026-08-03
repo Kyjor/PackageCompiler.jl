@@ -60,6 +60,14 @@ void set_depot_load_path(const char *root_dir) {
 #endif
 }
 
+static void set_live_data_env(void) {
+#ifdef _WIN32
+    _putenv_s("JULGAME_LIVE_DATA", "true");
+#else
+    setenv("JULGAME_LIVE_DATA", "true", 1);
+#endif
+}
+
 // main function (windows UTF16 -> UTF8 argument conversion code copied from
 // julia's ui/repl.c)
 #ifdef _WIN32
@@ -67,13 +75,19 @@ int wmain(int argc, wchar_t *wargv[], wchar_t *envp[]) {
     char **argv = (char **)malloc(sizeof(char *) * argc);
     if (!argv) return 1;
 
-    // Check for JULGAME_TEST argument
+    // JULGAME_TEST keeps the console; JULGAME_LIVE_DATA / JULGAME_TEST enable live sheet data
     bool hide_console = true;
+    bool live_data = false;
     for (int i = 1; i < argc; i++) {
         if (wcscmp(wargv[i], L"JULGAME_TEST") == 0) {
             hide_console = false;
-            break;
+            live_data = true;
+        } else if (wcscmp(wargv[i], L"JULGAME_LIVE_DATA") == 0) {
+            live_data = true;
         }
+    }
+    if (live_data) {
+        set_live_data_env();
     }
 
     if (hide_console) {
@@ -99,6 +113,18 @@ int wmain(int argc, wchar_t *wargv[], wchar_t *envp[]) {
 #else
 int main(int argc, char *argv[]) {
     argv = uv_setup_args(argc, argv);
+
+    bool live_data = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "JULGAME_TEST") == 0 ||
+            strcmp(argv[i], "JULGAME_LIVE_DATA") == 0) {
+            live_data = true;
+            break;
+        }
+    }
+    if (live_data) {
+        set_live_data_env();
+    }
 #endif
 
     // Find where eventual julia arguments start
