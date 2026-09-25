@@ -802,8 +802,9 @@ function create_sysimg_from_object_file(object_files::Vector{String},
    
     extra = get_extra_linker_flags(version, compat_level, soname)
    
-    # Optimize for size
-    cmd = `$(bitflag()) $(march()) -shared -Os -flto -L$(julia_libdir()) -L$(julia_private_libdir()) -o $sysimage_path $o_file_flags $(Base.shell_split(ldlibs())) $extra`
+    # -flto + Apple's new linker produces a sysimage that fails Julia's
+    # consistency check ("maybe opened the wrong version?"). Match upstream.
+    cmd = `$(bitflag()) $(march()) -shared -L$(julia_libdir()) -L$(julia_private_libdir()) -o $sysimage_path $o_file_flags $(Base.shell_split(ldlibs())) $extra`
    
     run_compiler(cmd; cplusplus=true)
     return nothing
