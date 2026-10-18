@@ -3,10 +3,6 @@ using Test
 using Libdl
 using Pkg
 
-import TOML
-
-ENV["JULIA_DEBUG"] = "PackageCompiler"
-
 # Make a new depot
 const new_depot = mktempdir()
 mkpath(joinpath(new_depot, "registries"))
@@ -27,70 +23,200 @@ const is_ci = tryparse(Bool, get(ENV, "CI", "")) === true
 #    macOS runners seem to be quite fast.)
 const is_slow_ci = is_ci && Sys.ARCH == :aarch64 && !Sys.isapple()
 
+# GitHub Actions shards the expensive build configurations across its test
+# matrix. Other test runners keep exercising every configuration by default.
+const app_configuration = get(ENV, "PACKAGECOMPILER_TEST_APP_CONFIGURATION", "all")
+const extended_tests = get(ENV, "PACKAGECOMPILER_TEST_EXTENDED", "all")
+
+function app_configurations()
+    configurations = if app_configuration == "all"
+        ((true, false), (false, true), (false, false))
+    elseif app_configuration == "default"
+        ((false, false),)
+    elseif app_configuration == "incremental"
+        ((true, false),)
+    elseif app_configuration == "filtered"
+        ((false, true),)
+    else
+        error("unknown PACKAGECOMPILER_TEST_APP_CONFIGURATION=$(repr(app_configuration))")
+    end
+
+    if app_configuration == "all" && is_slow_ci
+        return ((true, false), (false, true))
+    end
+    return configurations
+end
+
+extended_tests in ("all", "none", "sysimage", "library") ||
+    error("unknown PACKAGECOMPILER_TEST_EXTENDED=$(repr(extended_tests))")
+
 if is_ci
-    @info "This is a CI job" Sys.ARCH VERSION is_ci
+    @info "This is a CI job" Sys.ARCH VERSION is_ci app_configuration extended_tests
 end
 
 if is_slow_ci
     @warn "This is \"slow CI\" (defined as any non-macOS CI running on aarch64). Some tests will be skipped or modified." Sys.ARCH
 end
 
-@testset "PackageCompiler.jl" begin
-    @testset "create_sysimage" begin
-    new_project = mktempdir()
-    old_project = Base.ACTIVE_PROJECT[]
-    Base.ACTIVE_PROJECT[] = new_project
-    try
-        Pkg.add("Example")
-    finally
-        Base.ACTIVE_PROJECT[] = old_project
+# Sometimes directories seem to fail to clean up on CI (for undiagnosed
+# reasons), so retry them.
+function rm_with_retry(path; recursive::Bool=false, force::Bool=false,
+                       attempts::Int=20, max_delay::Real=5.0)
+    if isdir(path)
+        Base.Filesystem.prepare_for_deletion(path)
     end
-    tmp = mktempdir()
-    sysimage_path = joinpath(tmp, "sys." * Libdl.dlext)
-    script = tempname()
-    write(script, """
-    script_func() = println(\"I am a script\")
-    opt_during_sysimage = Base.JLOptions().opt_level
-    print_opt() = println("opt: -O\$opt_during_sysimage")
-    """)
-    create_sysimage(; sysimage_path=sysimage_path,
-                              project=new_project,
-                              precompile_execution_file=joinpath(@__DIR__, "precompile_execution.jl"),
-                              precompile_statements_file=joinpath.(@__DIR__, ["precompile_statements.jl",
-                                                                              "precompile_statements2.jl"]),
-                              script=script,
-                              sysimage_build_args = `-O1`
-                              )
+    # exponentially increase delay for the first ~half of attempts
+    delay = Float64(max_delay) / 2.0^(attempts ÷ 2)
+    for i in 1:attempts
+        try
+            rm(path; recursive=recursive, force=force)
+            return
+        catch e
+            (e isa Base.IOError && i < attempts) || rethrow()
+            sleep(delay)
+            delay = min(delay * 2, max_delay)
+        end
+    end
+end
 
-    # Check we can load sysimage and that Example is available in Main
-    str = read(`$(Base.julia_cmd()) -J $(sysimage_path) -e 'println(Example.hello("foo")); script_func(); print_opt()'`, String)
-    @test occursin("Hello, foo", str)
-    @test occursin("I am a script", str)
-    @test occursin("opt: -O1", str)
-    end # testset
+@testset "PackageCompiler.jl" begin
+    expected_sysimage_cpu_target = VERSION >= v"1.13-" ? "sysimage" : "native"
+    @test PackageCompiler.DEFAULT_SYSIMAGE_CPU_TARGET == expected_sysimage_cpu_target
+    @test PackageCompiler.expand_sysimage_cpu_target("native") == "native"
+    if VERSION >= v"1.13-"
+        # Query in a fresh process: package images loaded here overwrite `Sys.sysimage_target()`
+        sysimage_target = read(`$(Base.julia_cmd()) --startup-file=no -e 'print(Sys.sysimage_target())'`, String)
+        @test sysimage_target != "sysimage"
+        @test PackageCompiler.expand_sysimage_cpu_target("sysimage") == sysimage_target
+        @test PackageCompiler.expand_sysimage_cpu_target("sysimage;native") == sysimage_target * ";native"
+    else
+        @test PackageCompiler.expand_sysimage_cpu_target("sysimage") == "sysimage"
+    end
+
+    @testset "julia_libdir / julia_private_libdir" begin
+        lib_dir = PackageCompiler.julia_libdir()
+        private_libdir = PackageCompiler.julia_private_libdir()
+        @test isdir(lib_dir)
+        @test isdir(private_libdir)
+        for lib in ("libjulia-codegen", "libjulia-internal")
+            @test !isempty(PackageCompiler.glob(PackageCompiler.glob_pattern_lib(lib), private_libdir))
+        end
+        # `bundle_julia_libraries` reproduces this layout inside the bundle. Framework
+        # builds are the exception: they keep the private libraries in `Frameworks/`.
+        if !Base.DARWIN_FRAMEWORK
+            @test private_libdir in (lib_dir, joinpath(lib_dir, "julia"))
+        end
+    end
+
+    @testset "base_sysimage_cache_path" begin
+        cache_path(; kwargs...) = PackageCompiler.base_sysimage_cache_path(;
+            cpu_target="native", sysimage_build_args=`-O1`, sysimage_source="src", kwargs...)
+        path = cache_path()
+        @test path == cache_path()
+        @test path != cache_path(cpu_target="generic")
+        @test path != cache_path(sysimage_build_args=`-O2`)
+        @test path != cache_path(sysimage_source="different")
+        @test endswith(path, "." * Libdl.dlext)
+        # the cache lives in a scratch space of the (here temporary) depot
+        @test startswith(path, new_depot)
+        withenv("PACKAGECOMPILER_CACHE_BASE_SYSIMAGE" => "0") do
+            @test cache_path() === nothing
+        end
+
+        cache_dir = mktempdir()
+        keep, old = joinpath(cache_dir, "keep.so"), joinpath(cache_dir, "old.so")
+        foreach(touch, (keep, old))
+        stale_build_dir = mkdir(joinpath(cache_dir, "jl_stale"))
+        PackageCompiler.prune_base_sysimage_cache(cache_dir, keep)
+        @test isfile(keep) && isfile(old) && isdir(stale_build_dir)  # everything recent
+        PackageCompiler.prune_base_sysimage_cache(cache_dir, keep; max_age=-1)
+        @test readdir(cache_dir) == ["keep.so"]  # everything but the kept entry pruned
+    end
+
+    @testset "concurrent builds reuse the published base sysimage" begin
+        withenv("PACKAGECOMPILER_CACHE_BASE_SYSIMAGE" => nothing) do
+            cpu_target = "native"
+            cache_path = PackageCompiler.base_sysimage_cache_path(; cpu_target, sysimage_build_args=``,
+                sysimage_source=PackageCompiler.fresh_base_sysimage_source())
+            # Hold the lock as a concurrent build would. Once the call reports that it waits,
+            # publish an entry: the call must reuse it rather than build and replace it.
+            lock = PackageCompiler.mkpidlock(cache_path * ".pidfile")
+            logger = Test.TestLogger()
+            task = @async Base.CoreLogging.with_logger(logger) do
+                PackageCompiler.create_fresh_base_sysimage(; cpu_target, sysimage_build_args=``)
+            end
+            waiting() = any(l -> l.message isa AbstractString &&
+                                 occursin("waiting for another process", l.message), logger.logs)
+            try
+                # A call that never waits builds its own sysimage, so give up eventually.
+                timedwait(() -> waiting() || istaskdone(task), 300)
+                @test waiting()
+                write(cache_path, "published by another process")
+            finally
+                close(lock)
+            end
+            try
+                @test fetch(task) == cache_path
+                @test read(cache_path, String) == "published by another process"
+            finally
+                rm(cache_path; force=true)
+            end
+        end
+    end
+
+    tmp = mktempdir()
+
+    if extended_tests in ("all", "sysimage")
+        @testset "create_sysimage" begin
+            new_project = mktempdir()
+            old_project = Base.ACTIVE_PROJECT[]
+            Base.ACTIVE_PROJECT[] = new_project
+            try
+                Pkg.add("Example")
+            finally
+                Base.ACTIVE_PROJECT[] = old_project
+            end
+            sysimage_path = joinpath(tmp, "sys." * Libdl.dlext)
+            script = tempname()
+            write(script, """
+            script_func() = println(\"I am a script\")
+            opt_during_sysimage = Base.JLOptions().opt_level
+            print_opt() = println("opt: -O\$opt_during_sysimage")
+            """)
+            # Exercise sysimage compression on Julia versions that support it
+            compress_sysimage = PackageCompiler.supports_sysimage_compression()
+            create_sysimage(; sysimage_path,
+                            project=new_project,
+                            precompile_execution_file=joinpath(@__DIR__, "precompile_execution.jl"),
+                            precompile_statements_file=joinpath.(@__DIR__, ["precompile_statements.jl",
+                                                                          "precompile_statements2.jl"]),
+                            script,
+                            sysimage_build_args=`-O1`,
+                            compress_sysimage)
+
+            # Check we can load sysimage and that Example is available in Main
+            str = read(`$(Base.julia_cmd()) -J $(sysimage_path) -e 'println(Example.hello("foo")); script_func(); print_opt()'`, String)
+            @test occursin("Hello, foo", str)
+            @test occursin("I am a script", str)
+            @test occursin("opt: -O1", str)
+
+            if !PackageCompiler.supports_sysimage_compression()
+                @test_throws "requires Julia v1.13" create_sysimage(; sysimage_path,
+                                                                    project=new_project,
+                                                                    compress_sysimage=true)
+            end
+        end
+    end
 
     @testset "create_app" begin
-    # Test creating an app
-    app_source_dir = joinpath(@__DIR__, "..", "examples/MyApp/")
-    app_compiled_dir = joinpath(tmp, "MyAppCompiled")
-    if is_slow_ci
-        incrementals_list = (true, false)
-    else
-        incrementals_list = (true, false)
-    end
-    @testset for incremental in incrementals_list
-        if incremental == false
-            if is_slow_ci
-                @warn "Skipping the (incremental=false, filter_stdlibs=false) test because this is \"slow CI\""
-                @test_skip false
-                filter_stdlibs = (true,)
-            else
-                filter_stdlibs = (true, false)
-            end
-        else
-            filter_stdlibs = (false,)
+        # Test creating an app
+        app_source_dir = joinpath(@__DIR__, "..", "examples/MyApp/")
+        app_compiled_dir = joinpath(tmp, "MyAppCompiled")
+        if app_configuration == "all" && is_slow_ci
+            @warn "Skipping the (incremental=false, filter_stdlibs=false) test because this is \"slow CI\""
+            @test_skip false
         end
-        @testset for filter in filter_stdlibs
+        @testset for (incremental, filter) in app_configurations()
             @info "starting: create_app testset" incremental filter
             tmp_app_source_dir = joinpath(tmp, "MyApp")
             cp(app_source_dir, tmp_app_source_dir)
@@ -104,14 +230,24 @@ end
                                     "Undefined" => "undefined",
                                     ])
             finally
-            rm(tmp_app_source_dir; recursive=true)
+            rm_with_retry(tmp_app_source_dir; recursive=true)
             # Get rid of some local state
-            rm(joinpath(new_depot, "packages"); recursive=true, force=true)
-            rm(joinpath(new_depot, "compiled"); recursive=true, force=true)
-            rm(joinpath(new_depot, "artifacts"); recursive=true, force=true)
+            rm_with_retry(joinpath(new_depot, "packages"); recursive=true, force=true)
+            rm_with_retry(joinpath(new_depot, "compiled"); recursive=true, force=true)
+            rm_with_retry(joinpath(new_depot, "artifacts"); recursive=true, force=true)
             end # try
+            if !incremental
+                # the build should have left a base sysimage in the cache
+                cache_dir = dirname(PackageCompiler.base_sysimage_cache_path(
+                    cpu_target="native", sysimage_build_args=``, sysimage_source=""))
+                @test any(endswith("." * Libdl.dlext), readdir(cache_dir))
+            end
+            test_load_path = mktempdir()
+            test_depot_path = mktempdir()
             app_path(app_name) = abspath(app_compiled_dir, "bin", app_name * (Sys.iswindows() ? ".exe" : ""))
-            app_output = read(`$(app_path("MyApp")) I get --args áéíóú --julia-args --threads=3 --check-bounds=yes -O1`, String)
+            app_output = withenv("JULIA_DEPOT_PATH" => test_depot_path, "JULIA_LOAD_PATH" => test_load_path) do
+                read(`$(app_path("MyApp")) I get --args áéíóú --julia-args --threads=3 --check-bounds=yes -O1`, String)
+            end
 
             # Check stdlib filtering
             if filter == true
@@ -133,13 +269,18 @@ end
             @test occursin("""ARGS = ["I", "get", "--args", "áéíóú"]""", app_output)
             # Check julia-args
             @test occursin("(Base.JLOptions()).opt_level = 1", app_output)
-            @test occursin("(Base.JLOptions()).nthreads = 3", app_output)
+            # From Julia 1.12, --threads=3 adds 1 interactive thread
+            expected_threads = VERSION >= v"1.12-" ? 4 : 3
+            @test occursin("(Base.JLOptions()).nthreads = $expected_threads", app_output)
             @test occursin("(Base.JLOptions()).check_bounds = 1", app_output)
             # Check transitive inclusion of dependencies
             @test occursin("is_crayons_loaded() = true", app_output)
             # Check app is precompiled in a normal process
             @test occursin("outputo: ok", app_output)
             @test occursin("myrand: ok", app_output)
+            # Check env-provided depot and load paths are accepted
+            @test occursin("DEPOT_PATH = [\"$(escape_string(test_depot_path))", app_output)
+            @test occursin("LOAD_PATH = [\"$(escape_string(test_load_path))", app_output)
             # Check distributed
             @test occursin("n = 20000000", app_output)
             @test occursin("From worker 2:\t8", app_output)
@@ -172,40 +313,92 @@ end
             @test p.exitcode == 1
             @info "done: create_app testset" incremental filter
         end
-    end
     end # testset
 
-    if !is_slow_ci
-        # Test library creation
-        lib_source_dir = joinpath(@__DIR__, "..", "examples/MyLib")
-        lib_target_dir = joinpath(tmp, "MyLibCompiled")
+    if !is_slow_ci && extended_tests in ("all", "library")
+        @testset "create_library" begin
+            # Test library creation
+            lib_source_dir = joinpath(@__DIR__, "..", "examples/MyLib")
+            lib_target_dir = joinpath(tmp, "MyLibCompiled")
 
-        # This is why we have to skip this test on 1.12:
-        incremental = false
+            # Exercise nonincremental library creation with filtered stdlibs.
+            incremental = false
 
-        filter = true
-        lib_name = "inc"
+            filter = true
+            lib_name = "inc"
 
-        tmp_lib_src_dir = joinpath(tmp, "MyLib")
-        cp(lib_source_dir, tmp_lib_src_dir)
-        create_library(tmp_lib_src_dir, lib_target_dir; incremental=incremental, force=true, filter_stdlibs=filter,
-                    precompile_execution_file=joinpath(lib_source_dir, "build", "generate_precompile.jl"),
-                    precompile_statements_file=joinpath(lib_source_dir, "build", "additional_precompile.jl"),
-                    lib_name=lib_name, version=v"1.0.0")
-        rm(tmp_lib_src_dir; recursive=true)
+            tmp_lib_src_dir = joinpath(tmp, "MyLib")
+            cp(lib_source_dir, tmp_lib_src_dir)
+            create_library(tmp_lib_src_dir, lib_target_dir; incremental=incremental, force=true, filter_stdlibs=filter,
+                           precompile_execution_file=joinpath(lib_source_dir, "build", "generate_precompile.jl"),
+                           precompile_statements_file=joinpath(lib_source_dir, "build", "additional_precompile.jl"),
+                           lib_name=lib_name, version=v"1.0.0", compat_level="patch")
+            @test !isfile(splitext(PackageCompiler.default_julia_init())[1] * ".o")
+            rm_with_retry(tmp_lib_src_dir; recursive=true)
+        end
     end
 
     # Test creating an empty sysimage
-    if !is_slow_ci
-        tmp = mktempdir()
-        sysimage_path = joinpath(tmp, "empty." * Libdl.dlext)
-        foreach(x -> touch(joinpath(tmp, x)), ["Project.toml", "Manifest.toml"])
+    if !is_slow_ci && extended_tests in ("all", "sysimage")
+        @testset "create_empty_sysimage" begin
+            empty_tmp = mktempdir()
+            sysimage_path = joinpath(empty_tmp, "empty." * Libdl.dlext)
+            foreach(x -> touch(joinpath(empty_tmp, x)), ["Project.toml", "Manifest.toml"])
 
-        # This is why we need to skip this test on 1.12:
-        incremental=false
+            # Exercise a nonincremental empty sysimage with filtered stdlibs.
+            incremental = false
 
-        create_sysimage(String[]; sysimage_path=sysimage_path, incremental=incremental, filter_stdlibs=true, project=tmp)
-        hello = read(`$(Base.julia_cmd()) -J $(sysimage_path) -e 'print("hello, world")'`, String)
-        @test hello == "hello, world"
+            create_sysimage(String[]; sysimage_path, incremental, filter_stdlibs=true, project=empty_tmp)
+            hello = read(`$(Base.julia_cmd()) -J $(sysimage_path) -e 'print("hello, world")'`, String)
+            @test hello == "hello, world"
+        end
+
+        # On Julia 1.11 `precompilepkgs` silently compiled nothing under the
+        # base sysimage, which does not contain FileWatching (#1134)
+        @testset "ensurecompiled under fresh base sysimage" begin
+            downloads_tmp = mktempdir()
+            write(joinpath(downloads_tmp, "Project.toml"), """
+                [deps]
+                Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+                """)
+            old_project = Base.ACTIVE_PROJECT[]
+            Base.ACTIVE_PROJECT[] = downloads_tmp
+            try
+                Pkg.instantiate()
+            finally
+                Base.ACTIVE_PROJECT[] = old_project
+            end
+            # reuses the base sysimage cached by the nonincremental builds above
+            base_sysimage = PackageCompiler.create_fresh_base_sysimage(; cpu_target="native", sysimage_build_args=``)
+            PackageCompiler.ensurecompiled(downloads_tmp, ["Downloads"], base_sysimage)
+            code = """
+                pkg = Base.PkgId(Base.UUID("f43a241f-c20a-4ad4-852c-f6b1247861c6"), "Downloads")
+                print(Base.isprecompiled(pkg))
+                """
+            cmd = `$(PackageCompiler.get_julia_cmd()) --sysimage=$base_sysimage -e $code`
+            cmd = addenv(cmd, "JULIA_LOAD_PATH" => "$downloads_tmp$(Sys.iswindows() ? ';' : ':')@stdlib")
+            @test read(cmd, String) == "true"
+        end
     end
+
+    @testset "Workspace bundling" begin
+        ctx = PackageCompiler.create_pkg_context(joinpath(@__DIR__, "subproject"))
+        pkgs = PackageCompiler.load_all_deps(ctx)
+        # on >=1.12; don't load the full workspace
+        # on <1.12; it doesn't know it is in a workspace
+        @test length(pkgs) == 1
+        @test only(pkgs).name == "Example"
+
+        # Requested packages are included even when explicit transitive loading is disabled.
+        pkgids = PackageCompiler.package_ids_for_sysimage(ctx, ["Example"];
+                                                          include_transitive_dependencies=false)
+        @test only(pkgids).name == "Example"
+    end
+
+    @test applicable(create_sysimage, "Example")
+
+    header_files = String[]
+    missing_project = joinpath(mktempdir(), "missing")
+    @test_throws ErrorException create_library(missing_project, tempname(); header_files)
+    @test isempty(header_files)
 end
